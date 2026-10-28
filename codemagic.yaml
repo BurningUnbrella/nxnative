@@ -42,10 +42,9 @@ workflows:
             gdown \
             'backports.zstd; python_version < "3.14"'
 
-      - name: Download game from Google Drive
+      - name: Download and prepare game files
         script: |
           set -euo pipefail
-
           source "$CM_BUILD_DIR/.build-venv/bin/activate"
 
           mkdir -p \
@@ -54,7 +53,7 @@ workflows:
 
           umask 077
 
-          echo "Downloading your game from Google Drive..."
+          echo "Downloading game from Google Drive..."
 
           python -m gdown \
             "1w9-Q_z3C21paYf5ijQHgYoFrA4J3QahO" \
@@ -62,63 +61,86 @@ workflows:
             --continue \
             --retries 5
 
-          echo "Validating game archive..."
+          echo "Validating and extracting ZIP..."
 
           python - <<'PY'
           import os
           import pathlib
+          import shutil
           import stat
           import zipfile
 
-          root = (
-              pathlib.Path(os.environ["CM_BUILD_DIR"])
-              / "private"
-              / "game"
-          )
-
+          root = pathlib.Path(os.environ["CM_BUILD_DIR"]) / "private" / "game"
           archive = root.parent / "game.zip"
+          extensions = {".nsp", ".xci", ".nsz", ".xcz"}
 
           if not zipfile.is_zipfile(archive):
-              raise RuntimeError(
-                  "Google Drive download is not a valid ZIP. "
-                  "Check sharing permissions or download limits."
-              )
+              raise RuntimeError("Google Drive did not return a valid ZIP")
 
           with zipfile.ZipFile(archive) as z:
               for entry in z.infolist():
-                  name = entry.filename.replace("\\", "/")
-                  p = pathlib.PurePosixPath(name)
-
-                  if (
-                      p.is_absolute()
-                      or ".." in p.parts
-                      or not p.parts
-                  ):
-                      raise RuntimeError("Unsafe ZIP path")
-
+                  p = pathlib.PurePosixPath(entry.filename.replace("\\", "/"))
                   mode = entry.external_attr >> 16
 
-                  if stat.S_ISLNK(mode):
-                      raise RuntimeError(
-                          "ZIP contains a symbolic link"
-                      )
+                  if p.is_absolute() or ".." in p.parts:
+                      raise RuntimeError("Unsafe ZIP path")
 
-              print("Extracting game files...")
+                  if stat.S_ISLNK(mode):
+                      raise RuntimeError("ZIP contains symlinks")
+
               z.extractall(root)
 
-          matches = [
+          print("Searching for Switch game files...")
+
+          games = [
               p for p in root.rglob("*")
-              if p.is_file()
-              and p.suffix.lower()
-              in (".nsp", ".xci", ".nsz", ".xcz")
+              if p.is_file() and p.suffix.lower() in extensions
+              and not p.name.startswith("._")
           ]
 
-          if not matches:
-              raise RuntimeError(
-                  "No NSP/XCI/NSZ/XCZ game files found"
+          if not games:
+              raise RuntimeError("No NSP/XCI/NSZ/XCZ files found")
+
+          for game in games:
+              print(
+                  f"Found: {game.relative_to(root)} "
+                  f"({game.stat().st_size:,} bytes)"
               )
 
-          print(f"Found {len(matches)} game file(s).")
+              if game.parent != root:
+                  destination = root / game.name
+
+                  if destination.exists():
+                      raise RuntimeError(
+                          f"Duplicate filename: {game.name}"
+                      )
+
+                  shutil.move(str(game), str(destination))
+
+          print("Checking package headers...")
+
+          valid = []
+
+          for game in root.iterdir():
+              if game.suffix.lower() not in extensions:
+                  continue
+
+              with game.open("rb") as f:
+                  header = f.read(0x104)
+
+              if header[:4] == b"PFS0" or header[0x100:0x104] == b"HEAD":
+                  valid.append(game.name)
+                  print(f"Valid package header: {game.name}")
+              else:
+                  print(f"Unrecognized package header: {game.name}")
+
+          if not valid:
+              raise RuntimeError(
+                  "No recognized NSP/XCI packages. "
+                  "Check the extracted files."
+              )
+
+          print(f"Ready: {len(valid)} package(s)")
           PY
 
           rm -f "$CM_BUILD_DIR/private/game.zip"
@@ -138,15 +160,21 @@ workflows:
 
           test -s "$CM_BUILD_DIR/private/keys/prod.keys"
 
-          echo "Keys file prepared successfully."
+          echo "Keys prepared successfully."
 
       - name: Build IPA with nxnative
         script: |
           set -euo pipefail
-
           source "$CM_BUILD_DIR/.build-venv/bin/activate"
 
           mkdir -p "$CM_BUILD_DIR/artifacts"
+
+          echo "Game files ready:"
+          find "$CM_BUILD_DIR/private/game" \
+            -maxdepth 1 -type f \
+            \( -iname '*.nsp' -o -iname '*.xci' \
+               -o -iname '*.nsz' -o -iname '*.xcz' \) \
+            -print
 
           echo "Starting nxnative build..."
 
@@ -157,10 +185,11 @@ workflows:
             --platform ios
 
           echo "Checking IPA..."
-
           test -s "$CM_BUILD_DIR/artifacts/game.ipa"
 
           echo "IPA created successfully!"
+
+          rm -rf "$CM_BUILD_DIR/private"
 
     artifacts:
       - artifacts/*.ipa
