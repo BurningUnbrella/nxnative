@@ -52,7 +52,7 @@ workflows:
           echo "Downloading game from Google Drive..."
 
           python -m gdown \
-            "1w9-Q_z3C21paYf5ijQHgYoFrA4J3QahO" \
+            "1vI6OtlxgB5uxh6R-1ruPefMUOUEXF-Pw" \
             -O "$CM_BUILD_DIR/private/game.zip" \
             --continue \
             --retries 5
