@@ -35,14 +35,10 @@ workflows:
 
           python -m pip install --upgrade pip
           python -m pip install \
-            lz4 \
-            capstone \
-            fonttools \
-            nsz \
-            gdown \
+            lz4 capstone fonttools nsz gdown \
             'backports.zstd; python_version < "3.14"'
 
-      - name: Download and prepare game files
+      - name: Download and extract game
         script: |
           set -euo pipefail
           source "$CM_BUILD_DIR/.build-venv/bin/activate"
@@ -66,86 +62,65 @@ workflows:
           python - <<'PY'
           import os
           import pathlib
-          import shutil
           import stat
           import zipfile
 
           root = pathlib.Path(os.environ["CM_BUILD_DIR"]) / "private" / "game"
           archive = root.parent / "game.zip"
-          extensions = {".nsp", ".xci", ".nsz", ".xcz"}
 
           if not zipfile.is_zipfile(archive):
               raise RuntimeError("Google Drive did not return a valid ZIP")
 
           with zipfile.ZipFile(archive) as z:
               for entry in z.infolist():
-                  p = pathlib.PurePosixPath(entry.filename.replace("\\", "/"))
+                  p = pathlib.PurePosixPath(
+                      entry.filename.replace("\\", "/")
+                  )
                   mode = entry.external_attr >> 16
 
-                  if p.is_absolute() or ".." in p.parts:
-                      raise RuntimeError("Unsafe ZIP path")
-
-                  if stat.S_ISLNK(mode):
-                      raise RuntimeError("ZIP contains symlinks")
+                  if (
+                      p.is_absolute()
+                      or ".." in p.parts
+                      or stat.S_ISLNK(mode)
+                  ):
+                      raise RuntimeError("Unsafe ZIP entry")
 
               z.extractall(root)
 
-          print("Searching for Switch game files...")
+          extensions = {".nsp", ".xci", ".nsz", ".xcz"}
 
           games = [
               p for p in root.rglob("*")
-              if p.is_file() and p.suffix.lower() in extensions
+              if p.is_file()
+              and p.suffix.lower() in extensions
               and not p.name.startswith("._")
           ]
 
           if not games:
-              raise RuntimeError("No NSP/XCI/NSZ/XCZ files found")
+              raise RuntimeError("No Switch game files found")
 
-          for game in games:
-              print(
-                  f"Found: {game.relative_to(root)} "
-                  f"({game.stat().st_size:,} bytes)"
-              )
+          game_dirs = {p.parent for p in games}
 
-              if game.parent != root:
-                  destination = root / game.name
-
-                  if destination.exists():
-                      raise RuntimeError(
-                          f"Duplicate filename: {game.name}"
-                      )
-
-                  shutil.move(str(game), str(destination))
-
-          print("Checking package headers...")
-
-          valid = []
-
-          for game in root.iterdir():
-              if game.suffix.lower() not in extensions:
-                  continue
-
-              with game.open("rb") as f:
-                  header = f.read(0x104)
-
-              if header[:4] == b"PFS0" or header[0x100:0x104] == b"HEAD":
-                  valid.append(game.name)
-                  print(f"Valid package header: {game.name}")
-              else:
-                  print(f"Unrecognized package header: {game.name}")
-
-          if not valid:
+          if len(game_dirs) != 1:
               raise RuntimeError(
-                  "No recognized NSP/XCI packages. "
-                  "Check the extracted files."
+                  "Game files must be in one folder. "
+                  f"Found {len(game_dirs)} folders."
               )
 
-          print(f"Ready: {len(valid)} package(s)")
+          game_dir = next(iter(game_dirs))
+
+          print("Game directory:", game_dir)
+          for game in games:
+              print("Found:", game.name)
+
+          # Save the detected directory for the build step.
+          env_file = pathlib.Path(os.environ["CM_BUILD_DIR"]) / "game_path.env"
+          env_file.write_text(f"GAME_DIR={game_dir}\n")
           PY
 
           rm -f "$CM_BUILD_DIR/private/game.zip"
 
-      - name: Load private Nintendo Switch keys
+      - name: Load Nintendo Switch keys
         script: |
           set -euo pipefail
 
@@ -160,31 +135,25 @@ workflows:
 
           test -s "$CM_BUILD_DIR/private/keys/prod.keys"
 
-          echo "Keys prepared successfully."
+          echo "Keys loaded successfully."
 
       - name: Build IPA with nxnative
         script: |
           set -euo pipefail
           source "$CM_BUILD_DIR/.build-venv/bin/activate"
 
+          source "$CM_BUILD_DIR/game_path.env"
+
           mkdir -p "$CM_BUILD_DIR/artifacts"
 
-          echo "Game files ready:"
-          find "$CM_BUILD_DIR/private/game" \
-            -maxdepth 1 -type f \
-            \( -iname '*.nsp' -o -iname '*.xci' \
-               -o -iname '*.nsz' -o -iname '*.xcz' \) \
-            -print
-
-          echo "Starting nxnative build..."
+          echo "Building game from: $GAME_DIR"
 
           python scripts/build_ipa_from_nsp.py \
-            "$CM_BUILD_DIR/private/game" \
+            "$GAME_DIR" \
             -k "$CM_BUILD_DIR/private/keys/prod.keys" \
             -o "$CM_BUILD_DIR/artifacts/game.ipa" \
             --platform ios
 
-          echo "Checking IPA..."
           test -s "$CM_BUILD_DIR/artifacts/game.ipa"
 
           echo "IPA created successfully!"
