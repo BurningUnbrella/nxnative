@@ -1,1 +1,69 @@
-
+workflows:
+  nxnative-iphone:
+    name: NXNative - Build unsigned iPhone IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      xcode: 27.1
+      groups:
+        - nxnative_secrets
+    scripts:
+      - name: Check environment and download dependencies
+        script: |
+          set -euo pipefail
+          xcodebuild -version
+          uname -m
+          command -v brew
+          xcodebuild -downloadComponent MetalToolchain
+          brew install xcodegen zstd glslang
+          if ! command -v dotnet >/dev/null 2>&1; then brew install --cask dotnet-sdk; fi
+          PYTHON_BIN="$(command -v python3)"
+          "$PYTHON_BIN" -m pip install --user --break-system-packages lz4 capstone fonttools nsz 'backports.zstd; python_version < "3.14"' || \
+          "$PYTHON_BIN" -m pip install --user lz4 capstone fonttools nsz 'backports.zstd; python_version < "3.14"'
+      - name: Download your private game archive
+        script: |
+          set -euo pipefail
+          : "${GAME_ARCHIVE_URL:?Set GAME_ARCHIVE_URL in nxnative_secrets}"
+          mkdir -p "$CM_BUILD_DIR/private/game" "$CM_BUILD_DIR/private/keys"
+          umask 077
+          curl --fail --location --retry 3 --silent --show-error \
+            "$GAME_ARCHIVE_URL" -o "$CM_BUILD_DIR/private/game.zip"
+          python3 - <<'PY'
+          import os, pathlib, zipfile
+          root = pathlib.Path(os.environ['CM_BUILD_DIR']) / 'private' / 'game'
+          archive = root.parent / 'game.zip'
+          with zipfile.ZipFile(archive) as z:
+              for entry in z.infolist():
+                  name = entry.filename.replace('\\', '/')
+                  p = pathlib.PurePosixPath(name)
+                  if p.is_absolute() or '..' in p.parts:
+                      raise RuntimeError('Unsafe archive path')
+                  if (entry.external_attr >> 16) & 0o170000 == 0o120000:
+                      raise RuntimeError('Symlinks not allowed')
+              z.extractall(root)
+          matches = [p for p in root.rglob('*') if p.suffix.lower() in ('.nsp','.xci','.nsz','.xcz')]
+          if not matches:
+              raise RuntimeError('Archive contains no NSP/XCI/NSZ/XCZ files')
+          print(f'Found {len(matches)} game file(s).')
+          PY
+          rm -f "$CM_BUILD_DIR/private/game.zip"
+      - name: Load private keys
+        script: |
+          set -euo pipefail
+          : "${PROD_KEYS_B64:?Set PROD_KEYS_B64 in nxnative_secrets}"
+          umask 077
+          printf '%s' "$PROD_KEYS_B64" | base64 --decode > "$CM_BUILD_DIR/private/keys/prod.keys" || \
+          printf '%s' "$PROD_KEYS_B64" | base64 -D > "$CM_BUILD_DIR/private/keys/prod.keys"
+          test -s "$CM_BUILD_DIR/private/keys/prod.keys"
+      - name: Build IPA with nxnative
+        script: |
+          set -euo pipefail
+          mkdir -p "$CM_BUILD_DIR/artifacts"
+          python3 scripts/build_ipa_from_nsp.py \
+            "$CM_BUILD_DIR/private/game" \
+            -k "$CM_BUILD_DIR/private/keys/prod.keys" \
+            -o "$CM_BUILD_DIR/artifacts/game.ipa"
+          test -s "$CM_BUILD_DIR/artifacts/game.ipa"
+          rm -rf "$CM_BUILD_DIR/private"
+    artifacts:
+      - artifacts/*.ipa
